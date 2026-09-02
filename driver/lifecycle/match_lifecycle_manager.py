@@ -1,6 +1,7 @@
 """
-Match Lifecycle Manager for Plato Gin Rummy Autonomous Ranked Auto-Play.
-Detects and automates all match transitions: Lobby -> Queue -> In-Game -> Round End -> Match End -> Auto-Requeue.
+Match Lifecycle State Machine & Auto-Navigation Manager for Plato Gin Rummy.
+Handles seamless transitions between Matchmaking Lobby, In-Game Table,
+Round Summary, Match Victory/Defeat Summary, and Modal Popups.
 """
 from __future__ import annotations
 
@@ -16,50 +17,31 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from driver.dispatcher.touch_dispatcher import ADBTapDispatcher
-from vision.pipeline.scoreboard_ocr import ScoreboardOCR
+from vision.ocr.text_detector import FastTextOCR
 
 logger = logging.getLogger(__name__)
 
 
 class LifecycleState(str, Enum):
-    """Lifecycle phases in Plato Gin Rummy."""
-    LOBBY = "LOBBY"                      # In Plato game selector / lobby
-    MATCHMAKING = "MATCHMAKING"          # Finding ranked opponent spinner
-    INGAME = "INGAME"                    # Active card game table
-    ROUND_SUMMARY = "ROUND_SUMMARY"      # Hand finished, deadwood points tallying
-    MATCH_SUMMARY = "MATCH_SUMMARY"      # Full match finished (>=100 pts), winner announced
-    MODAL_POPUP = "MODAL_POPUP"          # Daily reward / disconnect / notification dialog
-    UNKNOWN = "UNKNOWN"                  # Unrecognized screen
-
-
-@dataclass
-class MatchStats:
-    """Historical telemetry for autonomous ranked sessions."""
-    matches_played: int = 0
-    matches_won: int = 0
-    matches_lost: int = 0
-    total_rounds_played: int = 0
-    rating_points_delta: int = 0
-    current_rating: int = 0
-    last_match_score: Tuple[int, int] = (0, 0)
-    session_start_time: float = field(default_factory=time.time)
-
-    @property
-    def win_rate(self) -> float:
-        if self.matches_played == 0:
-            return 0.0
-        return (self.matches_won / self.matches_played) * 100.0
+    """Current high-level lifecycle state in Plato Gin Rummy."""
+    UNKNOWN = "UNKNOWN"
+    LOBBY = "LOBBY"                  # Main menu / Ranked match selection
+    MATCHMAKING = "MATCHMAKING"      # Waiting for opponent queue
+    INGAME = "INGAME"                # Active Gin Rummy table match
+    ROUND_SUMMARY = "ROUND_SUMMARY"  # Intermediate score tally between hands
+    MATCH_SUMMARY = "MATCH_SUMMARY"  # Final victory / defeat screen (100 pts)
+    MODAL_POPUP = "MODAL_POPUP"      # Generic dialog / confirmation popup
+    ERROR_DISCONNECTED = "ERROR_DISCONNECTED"  # Disconnection banner
 
 
 @dataclass
 class LifecycleDetection:
-    """Detection output for current screen frame."""
+    """Detection result from inspecting the raw game screen."""
     state: LifecycleState
     confidence: float
     details: Dict[str, Any] = field(default_factory=dict)
@@ -67,58 +49,52 @@ class LifecycleDetection:
     reason: str = ""
 
 
+@dataclass
+class MatchStats:
+    """Session-level aggregate statistics across matches."""
+    matches_played: int = 0
+    matches_won: int = 0
+    total_rounds_played: int = 0
+    total_gin_calls: int = 0
+    total_undercuts: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    @property
+    def win_rate(self) -> float:
+        return (self.matches_won / self.matches_played * 100.0) if self.matches_played > 0 else 0.0
+
+
 class MatchLifecycleManager:
     """
-    Orchestrates out-of-game transitions so the bot can play 24/7 ranked matches
-    without human input.
+    Autonomous state machine that manages transitions across Plato Gin Rummy.
     """
 
-    def __init__(self, ocr_reader: Optional[ScoreboardOCR] = None, dispatcher: Optional[ADBTapDispatcher] = None):
-        self.ocr = ocr_reader or ScoreboardOCR()
-        self.dispatcher = dispatcher or ADBTapDispatcher()
+    def __init__(self, device_serial: Optional[str] = "2ace61d0", ocr_reader: Optional[FastTextOCR] = None):
+        self.device_serial = device_serial
+        self.ocr = ocr_reader or FastTextOCR()
+        self.dispatcher = ADBTapDispatcher(device_serial=device_serial)
+        self.current_state = LifecycleState.UNKNOWN
+        self.state_history: List[Tuple[float, LifecycleState]] = []
+        self.last_transition_time = time.time()
         self.stats = MatchStats()
 
-        # Debounce timestamps
-        self.last_transition_time = 0.0
-        self.last_state = LifecycleState.UNKNOWN
-        self.state_stable_count = 0
-        self.current_match_id = f"match_{int(time.time())}"
-        self._in_match_recorded = False
+        # Plato Ranked Match queue coordinates on 1800x2880 Xiaomi Pad 6 canvas
+        self.RANKED_MATCH_BTN = (1679, 993)
+        self.CONFIRM_JOIN_BTN = (1218, 1592)
+        self.MATCH_EXIT_BTN = (80, 80)
+        self.PLAY_AGAIN_BTN = (933, 1659)
 
     def detect_lifecycle_state(self, frame: np.ndarray) -> LifecycleDetection:
         """
-        Classifies screen frame into one of the LifecycleState phases.
-        Hardware resolution: 1800x2880.
+        Inspects the raw frame to accurately classify the lifecycle state.
         """
         if frame is None or frame.size == 0:
             return LifecycleDetection(state=LifecycleState.UNKNOWN, confidence=0.0, reason="Empty frame")
 
         h, w = frame.shape[:2]
 
-        # 1. Quick In-Game Table Check
-        # Felt color profile in center
-        center_crop = frame[int(0.30 * h):int(0.60 * h), int(0.20 * w):int(0.80 * w)]
-        avg_bgr = np.mean(center_crop, axis=(0, 1))
-        is_felt_background = bool((avg_bgr[1] > avg_bgr[0] + 8) and (avg_bgr[1] > avg_bgr[2] + 8))
-
-        # Check turn indicators / buttons
-        is_turn = self.ocr.is_player_turn(frame)
-        is_knock = self.ocr.is_knock_available(frame)
-        is_pass = self.ocr.is_pass_available(frame)
-
-        # Bottom HUD deadwood check
-        dw_val = self.ocr.read_deadwood(frame)
-
-        if is_turn or is_knock or is_pass or dw_val is not None:
-            return LifecycleDetection(
-                state=LifecycleState.INGAME,
-                confidence=0.99,
-                details={"is_turn": is_turn, "knock": is_knock, "pass": is_pass, "deadwood": dw_val},
-                reason="In-game table controls active"
-            )
-
-        # 2. Match Summary / Victory Screen Check
-        mid_strip = frame[int(0.40 * h):int(0.65 * h), int(0.10 * w):int(0.90 * w)]
+        # 1. Match Summary / Victory / Defeat Screen Check (Priority 1)
+        mid_strip = frame[int(0.35 * h):int(0.68 * h), int(0.10 * w):int(0.90 * w)]
         raw_text = ""
         if self.ocr.reader:
             try:
@@ -127,85 +103,94 @@ class MatchLifecycleManager:
             except Exception:
                 pass
 
-        if re.search(r"\b(won|victory|defeat|ranking|vs)\b", raw_text, re.IGNORECASE):
-            play_again_coords = (900, 2550)
+        if re.search(r"\b(won|forfeited|lost|victory|defeat|ranking|vs|rematch|play again)\b", raw_text, re.IGNORECASE):
+            # Target exact PLAY AGAIN button at (933, 1659) on 1800x2880 canvas
             return LifecycleDetection(
                 state=LifecycleState.MATCH_SUMMARY,
-                confidence=0.95,
+                confidence=0.98,
                 details={"text": raw_text},
-                recommended_tap=play_again_coords,
+                recommended_tap=(933, 1659),
                 reason=f"Match Summary detected: '{raw_text}'"
             )
 
-        # 3. Round Summary Check
-        if re.search(r"\b(gin|knock|undercut|bonus|round)\b", raw_text, re.IGNORECASE):
-            return LifecycleDetection(
-                state=LifecycleState.ROUND_SUMMARY,
-                confidence=0.90,
-                details={"text": raw_text},
-                recommended_tap=(900, 2500),
-                reason="Round score summary active"
-            )
-
-        # 4. Lobby / Ranked Queue Selection Check
-        bottom_nav = frame[int(0.80 * h):int(0.98 * h), int(0.10 * w):int(0.90 * w)]
-        nav_text = ""
+        # 2. Lobby / Ranked Match Selection Check (Priority 2)
+        lobby_strip = frame[int(0.10 * h):int(0.45 * h), int(0.05 * w):int(0.95 * w)]
+        lobby_text = ""
         if self.ocr.reader:
             try:
-                nav_list = self.ocr.reader.readtext(bottom_nav, detail=0)
-                nav_text = " ".join(nav_list)
+                lobby_txt_list = self.ocr.reader.readtext(lobby_strip, detail=0)
+                lobby_text = " ".join(lobby_txt_list)
             except Exception:
                 pass
 
-        if re.search(r"\b(ranked|play|find match|leaderboard|start)\b", nav_text, re.IGNORECASE):
+        if re.search(r"\b(ranked|gin rummy|join|create|custom|leaderboard|play)\b", lobby_text, re.IGNORECASE):
             return LifecycleDetection(
                 state=LifecycleState.LOBBY,
-                confidence=0.88,
-                details={"nav_text": nav_text},
-                recommended_tap=(900, 2500),
-                reason="Lobby / Play button detected"
+                confidence=0.95,
+                details={"text": lobby_text},
+                recommended_tap=self.RANKED_MATCH_BTN,
+                reason=f"Lobby Menu detected: '{lobby_text}'"
             )
 
-        # 5. Modal / Dialog Popup Check
-        if re.search(r"\b(ok|claim|cancel|reconnect|close)\b", raw_text + " " + nav_text, re.IGNORECASE):
+        # 3. Intermediate Round Summary Check (Score Tally between hands)
+        if re.search(r"\b(round|deadwood|bonus|score|next hand|continue)\b", raw_text, re.IGNORECASE):
+            return LifecycleDetection(
+                state=LifecycleState.ROUND_SUMMARY,
+                confidence=0.95,
+                details={"text": raw_text},
+                recommended_tap=(900, 2500),
+                reason=f"Round Summary detected: '{raw_text}'"
+            )
+
+        # 4. In-Game Green Felt Detection (Color Check)
+        felt_roi = frame[int(0.35 * h):int(0.55 * h), int(0.20 * w):int(0.80 * w)]
+        hsv_felt = cv2.cvtColor(felt_roi, cv2.COLOR_BGR2HSV)
+        # Deep green table felt mask: H: 35-85, S: 40-255, V: 20-200
+        lower_green = np.array([35, 30, 20])
+        upper_green = np.array([85, 255, 220])
+        mask = cv2.inRange(hsv_felt, lower_green, upper_green)
+        green_ratio = float(np.count_nonzero(mask) / mask.size)
+
+        if green_ratio > 0.40:
+            return LifecycleDetection(
+                state=LifecycleState.INGAME,
+                confidence=0.95,
+                details={"green_ratio": green_ratio},
+                reason=f"Table felt detected (Green ratio: {green_ratio:.2f})"
+            )
+
+        # 5. Modal Popup Confirmation
+        if re.search(r"\b(confirm|ok|cancel|accept|ready|start)\b", raw_text, re.IGNORECASE):
             return LifecycleDetection(
                 state=LifecycleState.MODAL_POPUP,
                 confidence=0.85,
                 details={"text": raw_text},
-                recommended_tap=(900, 1600),
-                reason="Modal popup detected"
+                recommended_tap=self.CONFIRM_JOIN_BTN,
+                reason=f"Modal popup detected: '{raw_text}'"
             )
 
-        # Default fallback: If felt background detected, assume in-game waiting
-        if is_felt_background:
-            return LifecycleDetection(
-                state=LifecycleState.INGAME,
-                confidence=0.75,
-                details={"felt": True},
-                reason="Table felt present, waiting for opponent/dealer"
-            )
-
+        # Fallback to UNKNOWN
         return LifecycleDetection(
             state=LifecycleState.UNKNOWN,
-            confidence=0.30,
-            details={"raw_text": raw_text},
-            reason="Unclassified screen state"
+            confidence=0.20,
+            details={"raw_text": raw_text, "green_ratio": green_ratio},
+            reason="Unrecognized screen layout"
         )
 
-    def execute_lifecycle_action(self, detection: LifecycleDetection, cooldown_s: float = 2.0) -> bool:
+    def execute_lifecycle_action(self, detection: LifecycleDetection) -> bool:
         """
-        Executes touch event to advance through non-gameplay screens autonomously.
-        Returns True if an out-of-game action was dispatched.
+        Executes the necessary navigation tap or ADB action to keep the bot in active ranked play.
         """
-        now = time.perf_counter()
-        if now - self.last_transition_time < cooldown_s:
+        now = time.time()
+        # Debounce transitions by at least 1.5s
+        if now - self.last_transition_time < 1.5:
             return False
 
         state = detection.state
 
         if state == LifecycleState.MATCH_SUMMARY:
-            logger.info(f"[Lifecycle] Match Summary Detected -> Dispatching Play Again / Next Match tap")
-            tap_coords = detection.recommended_tap or (900, 2550)
+            logger.info(f"[Lifecycle] Match Summary Detected -> Tapping PLAY AGAIN at {detection.recommended_tap or (933, 1659)}")
+            tap_coords = detection.recommended_tap or (933, 1659)
             self.dispatcher.tap(tap_coords[0], tap_coords[1])
             self.last_transition_time = now
             self.stats.matches_played += 1
@@ -220,16 +205,16 @@ class MatchLifecycleManager:
             return True
 
         elif state == LifecycleState.LOBBY:
-            logger.info(f"[Lifecycle] Lobby Detected -> Tapping Ranked Match / Play button")
-            tap_coords = detection.recommended_tap or (900, 2500)
-            self.dispatcher.tap(tap_coords[0], tap_coords[1])
+            logger.info(f"[Lifecycle] Lobby Detected -> Tapping JOIN Ranked Match at (1679, 993) + Confirm (1218, 1592)")
+            self.dispatcher.tap(1679, 993)
+            time.sleep(0.6)
+            self.dispatcher.tap(1218, 1592)
             self.last_transition_time = now
             return True
 
         elif state == LifecycleState.MODAL_POPUP:
-            logger.info(f"[Lifecycle] Modal Popup Detected -> Dismissing modal")
-            tap_coords = detection.recommended_tap or (900, 1600)
-            self.dispatcher.tap(tap_coords[0], tap_coords[1])
+            logger.info(f"[Lifecycle] Modal / Confirmation Popup Detected -> Tapping Confirm at (1218, 1592)")
+            self.dispatcher.tap(1218, 1592)
             self.last_transition_time = now
             return True
 
