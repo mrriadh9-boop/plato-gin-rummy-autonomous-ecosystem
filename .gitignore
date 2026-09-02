@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+.venv*/
+*.tmp
+*.log
+*.zip
+.agents/
+.idea/
+.vscode/
+data/debug_captures/
+data/live_debug/

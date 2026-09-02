@@ -1,0 +1,12 @@
+torch>=2.4.0
+torchvision>=0.19.0
+numpy>=1.26.0,<3.0.0
+opencv-python>=4.10.0
+onnxruntime>=1.19.0
+easyocr>=1.7.0
+PyQt6>=6.7.0
+mss>=9.0.0
+av>=12.0.0
+keyboard>=0.13.5
+scipy>=1.14.0
+pytest>=8.0.0
